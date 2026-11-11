@@ -4,15 +4,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+use disksize::{
+    ExportSheet, FolderNode, ScanProgress, count_folders, default_export_filename,
+    direct_files_size, format_count, format_size, list_top_level_folders,
+    scan_directory_cancellable, with_xlsx_extension, write_excel_export,
+};
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, UiBuilder};
 use rayon::prelude::*;
-use rust_xlsxwriter::{Color as XlsxColor, Format, FormatAlign, Workbook, Worksheet, XlsxError};
 
 // ================== THEME ==================
 
@@ -431,8 +435,7 @@ fn drive_selection_ui(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!(
-                            "Version {} · Christian Burau / Dataport",
-                            env!("CARGO_PKG_VERSION")
+                           env!("CARGO_PKG_VERSION")
                         ))
                         .size(12.0)
                         .color(theme::muted()),
@@ -782,47 +785,6 @@ fn paint_folder_icon(ui: &egui::Ui, rect: Rect, color: Color32) {
     );
 }
 
-// ================== FOLDER ENTRY ==================
-
-#[derive(Clone)]
-struct FolderNode {
-    path: PathBuf,
-    name: String,
-    size: u64,
-    children: Vec<FolderNode>,
-    is_scanned: bool,
-    has_access: bool,
-    expanded: bool,
-}
-
-impl FolderNode {
-    fn placeholder(path: PathBuf) -> Self {
-        Self {
-            name: node_name(&path),
-            path,
-            size: 0,
-            children: Vec::new(),
-            is_scanned: false,
-            has_access: true,
-            expanded: false,
-        }
-    }
-}
-
-fn node_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-// ================== SCAN PROGRESS ==================
-
-#[derive(Default)]
-struct ScanProgress {
-    directories: AtomicUsize,
-    files: AtomicUsize,
-}
-
 // ================== SCAN PAGE ==================
 
 enum ScanMessage {
@@ -1031,9 +993,12 @@ impl ScanPage {
 
         match write_excel_export(
             &path,
-            &self.root_path,
-            self.total_root_size,
-            &self.top_folders,
+            &[ExportSheet {
+                name: "Ordner".to_string(),
+                root_path: self.root_path.clone(),
+                total_size: self.total_root_size,
+                folders: &self.top_folders,
+            }],
         ) {
             Ok(folder_count) => {
                 self.notice = Some((
@@ -1968,236 +1933,6 @@ fn summary_item(ui: &mut egui::Ui, label: &str, value: &str) {
     );
 }
 
-fn format_count(value: usize) -> String {
-    let digits = value.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, character) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push('.');
-        }
-        formatted.push(character);
-    }
-
-    formatted.chars().rev().collect()
-}
-
-// ================== EXCEL EXPORT ==================
-
-const EXPORT_HEADER_ROW: u32 = 5;
-const EXPORT_FIRST_DATA_ROW: u32 = 6;
-const EXCEL_MAX_ROWS: u32 = 1_048_576;
-
-fn default_export_filename(root: &str) -> String {
-    let label: String = root
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    let label = label.trim_matches('_');
-    let label = if label.is_empty() { "Export" } else { label };
-
-    format!("DiskSize_{label}.xlsx")
-}
-
-fn with_xlsx_extension(mut path: PathBuf) -> PathBuf {
-    let has_xlsx_extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("xlsx"))
-        .unwrap_or(false);
-
-    if !has_xlsx_extension {
-        path.set_extension("xlsx");
-    }
-
-    path
-}
-
-fn count_folders(folders: &[FolderNode]) -> usize {
-    folders
-        .iter()
-        .map(|folder| 1 + count_folders(&folder.children))
-        .sum()
-}
-
-struct ExportFormats {
-    bytes: Format,
-    percent: Format,
-    denied: Format,
-}
-
-/// Schreibt die Ordnerübersicht als Excel-Arbeitsmappe und liefert die Anzahl
-/// der exportierten Ordner zurück.
-fn write_excel_export(
-    path: &Path,
-    root_path: &str,
-    total_size: u64,
-    folders: &[FolderNode],
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let folder_count = count_folders(folders);
-
-    let mut workbook = Workbook::new();
-    let sheet = workbook.add_worksheet();
-    sheet.set_name("Ordner")?;
-
-    let title_format = Format::new().set_bold().set_font_size(14.0);
-    let label_format = Format::new().set_bold();
-    let header_format = Format::new()
-        .set_bold()
-        .set_font_color(XlsxColor::White)
-        .set_background_color(XlsxColor::RGB(0x21_96_F3))
-        .set_align(FormatAlign::Center)
-        .set_text_wrap();
-    let bytes_format = Format::new().set_num_format("#,##0");
-    let percent_format = Format::new().set_num_format("0.0%");
-    let denied_format = Format::new()
-        .set_italic()
-        .set_font_color(XlsxColor::RGB(0xB7_1C_1C));
-
-    let formats = ExportFormats {
-        bytes: bytes_format,
-        percent: percent_format,
-        denied: denied_format,
-    };
-
-    sheet.merge_range(0, 0, 0, 6, "DiskSize – Ordnerübersicht", &title_format)?;
-    sheet.set_row_height(0, 22.0)?;
-
-    sheet.write_string_with_format(1, 0, "Quelle:", &label_format)?;
-    sheet.write_string(1, 1, root_path)?;
-
-    sheet.write_string_with_format(2, 0, "Gesamtgröße:", &label_format)?;
-    sheet.write_number_with_format(2, 1, total_size as f64, &formats.bytes)?;
-    sheet.write_string(2, 2, format_size(total_size))?;
-
-    sheet.write_string_with_format(3, 0, "Ordner:", &label_format)?;
-    sheet.write_number(3, 1, folder_count as f64)?;
-
-    let headers = [
-        "Ebene",
-        "Ordner",
-        "Pfad",
-        "Größe (Bytes)",
-        "Größe",
-        "Anteil",
-        "Status",
-    ];
-
-    for (column, header) in headers.iter().enumerate() {
-        sheet.write_string_with_format(
-            EXPORT_HEADER_ROW,
-            column as u16,
-            *header,
-            &header_format,
-        )?;
-    }
-
-    let mut row = EXPORT_FIRST_DATA_ROW;
-
-    // Stammzeile
-    sheet.write_number(row, 0, 0.0)?;
-    sheet.write_string(row, 1, root_path)?;
-    sheet.write_string(row, 2, root_path)?;
-    sheet.write_number_with_format(row, 3, total_size as f64, &formats.bytes)?;
-    sheet.write_string(row, 4, format_size(total_size))?;
-    sheet.write_number_with_format(row, 5, 1.0, &formats.percent)?;
-    row += 1;
-
-    write_excel_rows(sheet, &mut row, folders, 1, total_size, &formats)?;
-
-    if row > EXPORT_FIRST_DATA_ROW {
-        sheet.autofilter(EXPORT_HEADER_ROW, 0, row - 1, 6)?;
-    }
-
-    sheet.set_freeze_panes(EXPORT_FIRST_DATA_ROW, 0)?;
-
-    sheet.set_column_width(0, 7.0)?;
-    sheet.set_column_width(1, 30.0)?;
-    sheet.set_column_width(2, 70.0)?;
-    sheet.set_column_width(3, 16.0)?;
-    sheet.set_column_width(4, 12.0)?;
-    sheet.set_column_width(5, 9.0)?;
-    sheet.set_column_width(6, 20.0)?;
-
-    workbook.save(path)?;
-
-    Ok(folder_count)
-}
-
-fn write_excel_rows(
-    sheet: &mut Worksheet,
-    row: &mut u32,
-    folders: &[FolderNode],
-    level: u32,
-    total_size: u64,
-    formats: &ExportFormats,
-) -> Result<(), XlsxError> {
-    for folder in folders {
-        // Excel erlaubt maximal 1.048.576 Zeilen.
-        if *row >= EXCEL_MAX_ROWS {
-            return Ok(());
-        }
-
-        let share = if total_size > 0 {
-            folder.size as f64 / total_size as f64
-        } else {
-            0.0
-        };
-
-        sheet.write_number(*row, 0, level as f64)?;
-
-        if folder.has_access {
-            sheet.write_string(*row, 1, &folder.name)?;
-            sheet.write_string(*row, 2, folder.path.to_string_lossy())?;
-            sheet.write_string(*row, 6, "")?;
-        } else {
-            sheet.write_string_with_format(*row, 1, &folder.name, &formats.denied)?;
-            sheet.write_string_with_format(
-                *row,
-                2,
-                folder.path.to_string_lossy(),
-                &formats.denied,
-            )?;
-            sheet.write_string_with_format(*row, 6, "Zugriff verweigert", &formats.denied)?;
-        }
-
-        sheet.write_number_with_format(*row, 3, folder.size as f64, &formats.bytes)?;
-        sheet.write_string(*row, 4, format_size(folder.size))?;
-        sheet.write_number_with_format(*row, 5, share, &formats.percent)?;
-
-        *row += 1;
-
-        write_excel_rows(sheet, row, &folder.children, level + 1, total_size, formats)?;
-    }
-
-    Ok(())
-}
-
-// ================== UTILS ==================
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes < KB {
-        format!("{bytes} B")
-    } else if bytes < MB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else if bytes < GB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    }
-}
-
 // ================== OPEN IN EXPLORER ==================
 
 fn open_in_explorer(path: &Path) -> std::io::Result<()> {
@@ -2272,31 +2007,11 @@ fn is_drive_mount(_mount: &Path) -> bool {
 }
 
 fn get_drives() -> Vec<DriveInfo> {
-    use sysinfo::Disks;
+    #[cfg(target_os = "windows")]
+    let mut drives = windows_drives();
 
-    let disks = Disks::new_with_refreshed_list();
-
-    let mut drives: Vec<DriveInfo> = disks
-        .list()
-        .iter()
-        .filter(|disk| is_drive_mount(disk.mount_point()))
-        .map(|disk| {
-            let mount = normalize_mount(disk.mount_point());
-            let label = disk.name().to_string_lossy().trim().to_string();
-
-            DriveInfo {
-                label: if label.is_empty() {
-                    mount.clone()
-                } else {
-                    label
-                },
-                mount,
-                total: disk.total_space(),
-                available: disk.available_space(),
-                removable: disk.is_removable(),
-            }
-        })
-        .collect();
+    #[cfg(not(target_os = "windows"))]
+    let mut drives = sysinfo_drives();
 
     drives.sort_by_key(|drive| drive.mount.to_lowercase());
     drives.dedup_by(|a, b| a.mount.eq_ignore_ascii_case(&b.mount));
@@ -2319,6 +2034,109 @@ fn get_drives() -> Vec<DriveInfo> {
     drives
 }
 
+/// Liest alle logischen Laufwerke inklusive verbundener Netzlaufwerke.
+#[cfg(target_os = "windows")]
+fn windows_drives() -> Vec<DriveInfo> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    };
+
+    // Liste hat die Form "C:\\\0D:\\\0...\0".
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+
+    if length == 0 || length as usize >= buffer.len() {
+        return Vec::new();
+    }
+
+    let mut drives = Vec::new();
+    let mut index = 0;
+
+    while index < length as usize {
+        let remaining = &buffer[index..length as usize];
+        let Some(end) = remaining.iter().position(|&character| character == 0) else {
+            break;
+        };
+
+        if end == 0 {
+            break;
+        }
+
+        let mount = String::from_utf16_lossy(&remaining[..end]);
+        index += end + 1;
+
+        if !is_drive_mount(Path::new(&mount)) {
+            continue;
+        }
+
+        let mount_wide = wide_null(&mount);
+        let drive_type = unsafe { GetDriveTypeW(mount_wide.as_ptr()) };
+
+        // Feste, wechselbare und Netzlaufwerke sowie RAM-Disks anzeigen.
+        if !matches!(
+            drive_type,
+            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_REMOTE | DRIVE_RAMDISK
+        ) {
+            continue;
+        }
+
+        let (total, available) = match windows_disk_space(&mount) {
+            Some(space) => space,
+            // Nicht verbundene Netzlaufwerke nicht als leere Einträge anzeigen.
+            None if drive_type == DRIVE_REMOTE => continue,
+            None => (0, 0),
+        };
+
+        let label = windows_volume_label(&mount).unwrap_or_else(|| mount.clone());
+
+        drives.push(DriveInfo {
+            mount,
+            label,
+            total,
+            available,
+            removable: drive_type == DRIVE_REMOVABLE,
+        });
+    }
+
+    drives
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sysinfo_drives() -> Vec<DriveInfo> {
+    use sysinfo::Disks;
+
+    let disks = Disks::new_with_refreshed_list();
+
+    disks
+        .list()
+        .iter()
+        .filter(|disk| is_drive_mount(disk.mount_point()))
+        .map(|disk| {
+            let mount = normalize_mount(disk.mount_point());
+            let label = disk.name().to_string_lossy().trim().to_string();
+
+            DriveInfo {
+                label: if label.is_empty() {
+                    mount.clone()
+                } else {
+                    label
+                },
+                mount,
+                total: disk.total_space(),
+                available: disk.available_space(),
+                removable: disk.is_removable(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn drive_space(path: &str) -> (u64, u64) {
+    windows_disk_space(path).unwrap_or((0, 0))
+}
+
+#[cfg(not(target_os = "windows"))]
 fn drive_space(path: &str) -> (u64, u64) {
     use sysinfo::{Disk, Disks};
 
@@ -2334,47 +2152,62 @@ fn drive_space(path: &str) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-// ================== SCAN ==================
+#[cfg(target_os = "windows")]
+fn windows_disk_space(path: &str) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-fn list_top_level_folders(root: &str) -> Vec<FolderNode> {
-    let mut folders = Vec::new();
+    let path = wide_null(path);
+    let mut total = 0u64;
+    let mut available = 0u64;
 
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let is_dir = entry
-                .file_type()
-                .map(|file_type| file_type.is_dir() && !file_type.is_symlink())
-                .unwrap_or(false);
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            std::ptr::null_mut(),
+            &mut total,
+            &mut available,
+        )
+    };
 
-            if is_dir {
-                folders.push(FolderNode::placeholder(entry.path()));
-            }
-        }
+    (success != 0).then_some((total, available))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_volume_label(root: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let root = wide_null(root);
+    let mut name = [0u16; 256];
+
+    let success = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if success == 0 {
+        return None;
     }
 
-    folders.sort_by(|a, b| a.path.cmp(&b.path));
+    let length = name.iter().position(|&character| character == 0)?;
+    let label = String::from_utf16_lossy(&name[..length]).trim().to_string();
 
-    folders
+    if label.is_empty() { None } else { Some(label) }
 }
 
-/// Summe der Dateien, die direkt im Verzeichnis liegen (nicht rekursiv).
-fn direct_files_size(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let file_type = entry.file_type().ok()?;
-                    if file_type.is_file() {
-                        entry.metadata().ok().map(|m| m.len())
-                    } else {
-                        None
-                    }
-                })
-                .sum::<u64>()
-        })
-        .unwrap_or(0)
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+// ================== SCAN ==================
 
 fn start_scan(
     root: &str,
@@ -2443,224 +2276,4 @@ fn start_scan(
     });
 
     (receiver, cancel, progress)
-}
-
-/// Scannt ein Verzeichnis rekursiv und parallel.
-#[cfg(test)]
-fn scan_directory(path: &Path) -> FolderNode {
-    let cancel = AtomicBool::new(false);
-    let progress = ScanProgress::default();
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
-
-    pool.install(|| scan_directory_cancellable(path, &cancel, &progress))
-}
-
-fn scan_directory_cancellable(
-    path: &Path,
-    cancel: &AtomicBool,
-    progress: &ScanProgress,
-) -> FolderNode {
-    let mut children = Vec::new();
-
-    if cancel.load(Ordering::Relaxed) {
-        return FolderNode {
-            path: path.to_path_buf(),
-            name: node_name(path),
-            size: 0,
-            children,
-            is_scanned: false,
-            has_access: true,
-            expanded: false,
-        };
-    }
-
-    progress.directories.fetch_add(1, Ordering::Relaxed);
-
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries.flatten().collect::<Vec<_>>(),
-        Err(_) => {
-            return FolderNode {
-                path: path.to_path_buf(),
-                name: node_name(path),
-                size: 0,
-                children,
-                is_scanned: true,
-                has_access: false,
-                expanded: false,
-            };
-        }
-    };
-
-    let results: Vec<(u64, Option<FolderNode>)> = entries
-        .into_par_iter()
-        .filter_map(|entry| {
-            if cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            let file_type = entry.file_type().ok()?;
-
-            if file_type.is_symlink() {
-                return None;
-            }
-
-            if file_type.is_file() {
-                progress.files.fetch_add(1, Ordering::Relaxed);
-
-                let size = entry.metadata().ok()?.len();
-
-                Some((size, None))
-            } else if file_type.is_dir() {
-                let child = scan_directory_cancellable(&entry.path(), cancel, progress);
-
-                Some((child.size, Some(child)))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut total_size = 0u64;
-
-    for (size, child) in results {
-        total_size = total_size.saturating_add(size);
-
-        if let Some(child) = child {
-            children.push(child);
-        }
-    }
-
-    children.sort_by_key(|child| std::cmp::Reverse(child.size));
-
-    FolderNode {
-        path: path.to_path_buf(),
-        name: node_name(path),
-        size: total_size,
-        children,
-        is_scanned: !cancel.load(Ordering::Relaxed),
-        has_access: true,
-        expanded: false,
-    }
-}
-
-// ================== TESTS ==================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_dir(prefix: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-
-        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
-    }
-
-    #[test]
-    fn formats_sizes() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(1024 * 1024), "1.0 MB");
-        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
-    }
-
-    #[test]
-    fn scans_nested_directories() {
-        let root = unique_dir("disksize-rust-test");
-
-        fs::create_dir_all(root.join("a").join("b")).unwrap();
-
-        fs::write(root.join("root.txt"), vec![0u8; 10]).unwrap();
-        fs::write(root.join("a").join("x.txt"), vec![0u8; 20]).unwrap();
-        fs::write(root.join("a").join("b").join("y.txt"), vec![0u8; 30]).unwrap();
-
-        let result = scan_directory(&root);
-
-        assert!(result.is_scanned);
-        assert!(result.has_access);
-        assert_eq!(result.size, 60);
-        assert_eq!(result.children.len(), 1);
-        assert_eq!(result.children[0].size, 50);
-        assert_eq!(result.children[0].children.len(), 1);
-        assert_eq!(result.children[0].children[0].size, 30);
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn cancellation_aborts_scan() {
-        let cancel = AtomicBool::new(true);
-        let progress = ScanProgress::default();
-
-        let node = scan_directory_cancellable(Path::new("."), &cancel, &progress);
-
-        assert!(!node.is_scanned);
-        assert_eq!(node.size, 0);
-    }
-
-    #[test]
-    fn lists_only_directories() {
-        let root = unique_dir("disksize-rust-list-test");
-
-        fs::create_dir_all(root.join("folder")).unwrap();
-        fs::write(root.join("file.txt"), b"x").unwrap();
-
-        let folders = list_top_level_folders(root.to_str().unwrap());
-
-        assert_eq!(folders.len(), 1);
-        assert_eq!(folders[0].name, "folder");
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn counts_direct_files_only() {
-        let root = unique_dir("disksize-rust-direct-test");
-
-        fs::create_dir_all(root.join("sub")).unwrap();
-        fs::write(root.join("a.txt"), vec![0u8; 7]).unwrap();
-        fs::write(root.join("sub").join("b.txt"), vec![0u8; 100]).unwrap();
-
-        assert_eq!(direct_files_size(&root), 7);
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn exports_excel_workbook() {
-        let root = unique_dir("disksize-rust-export-test");
-
-        fs::create_dir_all(root.join("a")).unwrap();
-        fs::write(root.join("a").join("x.txt"), vec![0u8; 42]).unwrap();
-
-        let tree = scan_directory(&root);
-        let total = tree.size;
-        let file = root.join("export.xlsx");
-
-        let count = write_excel_export(
-            &file,
-            root.to_str().unwrap(),
-            total,
-            std::slice::from_ref(&tree),
-        )
-        .unwrap();
-
-        assert_eq!(count, 2);
-        assert!(file.exists());
-
-        // xlsx-Dateien sind ZIP-Archive und beginnen mit "PK".
-        let bytes = fs::read(&file).unwrap();
-        assert!(bytes.len() > 2);
-        assert_eq!(&bytes[0..2], b"PK");
-
-        fs::remove_dir_all(&root).unwrap();
-    }
 }

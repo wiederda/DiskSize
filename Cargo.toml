@@ -5,6 +5,16 @@ version = "1.0.0"
 edition = "2024"
 description = "DiskSize – Disk Usage Analyzer"
 
+[lib]
+name = "disksize"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
+
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = [
     "accesskit",
